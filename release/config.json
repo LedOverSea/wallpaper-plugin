@@ -1,0 +1,9 @@
+{
+  "configFile": "",
+  "player": "D:/program files/PotPlayer/PotPlayerMini64.exe",
+  "hotkey": "Ctrl+Alt+P",
+  "monitor": "Monitor0",
+  "extraArgs": "",
+  "showBalloon": true,
+  "videoExtensions": ".mp4,.webm,.mkv,.avi,.mov,.m4v,.wmv,.flv,.mpg,.mpeg,.ts"
+}
