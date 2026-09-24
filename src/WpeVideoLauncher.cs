@@ -80,7 +80,11 @@ namespace WpeVideoLauncher
         public string Monitor = "Monitor0";
         public string ExtraArgs = "";      // 追加给播放器的参数，例如 /new
         public bool ShowBalloon = true;
+        public string LogFile = "";        // launcher.log 路径；留空 = 自动(项目目录 > exe 旁边 > %LOCALAPPDATA%)
         public string[] VideoExtensions = { ".mp4", ".webm", ".mkv", ".avi", ".mov", ".m4v", ".wmv", ".flv", ".mpg", ".mpeg", ".ts" };
+
+        /// 最近一次 Load() 的结果，供 Log 判断用户是否指定了 logFile
+        public static Config Current;
 
         public static string ExeDir
         {
@@ -108,6 +112,7 @@ namespace WpeVideoLauncher
             "  \"monitor\": \"Monitor0\",\n" +
             "  \"extraArgs\": \"\",\n" +
             "  \"showBalloon\": true,\n" +
+            "  \"logFile\": \"\",\n" +
             "  \"videoExtensions\": \".mp4,.webm,.mkv,.avi,.mov,.m4v,.wmv,.flv,.mpg,.mpeg,.ts\"\n" +
             "}\n";
 
@@ -135,6 +140,10 @@ namespace WpeVideoLauncher
             string userTxt;
             if (TryReadAllText(ConfigPath, out userTxt)) txt = userTxt;
             else if (TryReadAllText(UserConfigPath, out userTxt)) txt = userTxt;
+
+            // 先把 logFile 定下来再写任何日志，免得 WARN 落到默认位置
+            c.LogFile = Str(txt, "logFile", c.LogFile);
+            Current = c;
 
             c.ConfigFile = Str(txt, "configFile", c.ConfigFile);
             c.Player = Str(txt, "player", c.Player);
@@ -227,26 +236,194 @@ namespace WpeVideoLauncher
     internal static class Log
     {
         private static readonly object Gate = new object();
+        private static readonly object PathGate = new object();
         private static string _file;
 
-        /// 优先写在 exe 旁边；若该目录不可写(比如放在受保护目录)，自动退到 %LOCALAPPDATA%
+        /// 日志落点，按优先级：
+        ///   1. config.json 的 logFile（绝对路径，或相对 exe 目录）
+        ///   2. 项目/源码目录（含 src\WpeVideoLauncher.cs 的那个目录）
+        ///   3. exe 所在目录（仅当它不是桌面/文档/下载这类"用户看得见"的目录）
+        ///   4. %LOCALAPPDATA%\WpeVideoLauncher
+        ///   5. 临时目录
+        /// 不再无条件写在 exe 旁边：exe 常常就放在桌面上，日志会直接糊在桌面。
         public static string File
         {
             get
             {
                 if (_file != null) return _file;
-                string beside = Path.Combine(Config.ExeDir, "launcher.log");
-                if (CanWrite(Config.ExeDir)) { _file = beside; return _file; }
-                try
+                lock (PathGate)
                 {
-                    string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WpeVideoLauncher");
-                    Directory.CreateDirectory(dir);
-                    if (CanWrite(dir)) { _file = Path.Combine(dir, "launcher.log"); return _file; }
+                    if (_file == null) _file = ResolveFile();
+                    return _file;
                 }
-                catch { }
-                _file = Path.Combine(Path.GetTempPath(), "WpeVideoLauncher.log");
-                return _file;
             }
+        }
+
+        /// 配置改了 logFile 之后调用，下次写入重新定位
+        public static void Reset()
+        {
+            lock (PathGate) { _file = null; }
+        }
+
+        private static string ResolveFile()
+        {
+            // 1) 配置里显式指定
+            try
+            {
+                string configured = Config.Current == null ? null : Config.Current.LogFile;
+                if (!string.IsNullOrEmpty(configured))
+                {
+                    string p = Path.IsPathRooted(configured) ? configured : Path.Combine(Config.ExeDir, configured);
+                    if (EnsureDir(p)) return p;
+                }
+            }
+            catch { }
+
+            // 2) 项目目录：开发时日志就该跟源码在一起，而不是散在桌面上
+            try
+            {
+                string proj = FindProjectDir();
+                if (proj != null && CanWrite(proj)) return Path.Combine(proj, "launcher.log");
+            }
+            catch { }
+
+            // 3) exe 旁边（绿色运行），但躲开桌面/文档这类目录
+            if (!IsUserFolder(Config.ExeDir) && CanWrite(Config.ExeDir))
+                return Path.Combine(Config.ExeDir, "launcher.log");
+
+            // 4) 用户数据目录
+            try
+            {
+                string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WpeVideoLauncher");
+                Directory.CreateDirectory(dir);
+                if (CanWrite(dir)) return Path.Combine(dir, "launcher.log");
+            }
+            catch { }
+
+            // 5) 兜底
+            return Path.Combine(Path.GetTempPath(), "WpeVideoLauncher.log");
+        }
+
+        /// 本项目的源码目录 = 含 src\WpeVideoLauncher.cs 的目录。
+        /// 先查 exe 自身与各级上级（exe 编译在 release\ 下时命中），
+        /// 再从 exe 目录往下找 1~3 层（exe 被复制到桌面或别处时照样能找到项目）。
+        private static string FindProjectDir()
+        {
+            try
+            {
+                DirectoryInfo d = new DirectoryInfo(Config.ExeDir);
+                for (int i = 0; d != null && i < 12; i++, d = d.Parent)
+                    if (IsProjectDir(d.FullName)) return d.FullName;
+            }
+            catch { }
+            return FindProjectBelow(Config.ExeDir, 3);
+        }
+
+        private static bool IsProjectDir(string dir)
+        {
+            // 注意: 本类里有 File 属性, 必须写全名 System.IO.File
+            try { return System.IO.File.Exists(Path.Combine(Path.Combine(dir, "src"), "WpeVideoLauncher.cs")); }
+            catch { return false; }
+        }
+
+        /// 有界广度优先：最多 3 层、最多看 2000 个目录，跳过 .git / node_modules / 系统目录
+        private static string FindProjectBelow(string root, int maxDepth)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(root) || !Directory.Exists(root)) return null;
+                var dirs = new Queue<string>();
+                var lvls = new Queue<int>();
+                dirs.Enqueue(root); lvls.Enqueue(0);
+                int visited = 0;
+                while (dirs.Count > 0 && visited < 2000)
+                {
+                    string cur = dirs.Dequeue();
+                    int lvl = lvls.Dequeue();
+                    if (lvl >= maxDepth) continue;
+                    string[] subs;
+                    try { subs = Directory.GetDirectories(cur); } catch { continue; }
+                    foreach (string s in subs)
+                    {
+                        if (++visited > 2000) break;
+                        if (SkipDir(s)) continue;
+                        if (IsProjectDir(s)) return s;
+                        dirs.Enqueue(s); lvls.Enqueue(lvl + 1);
+                    }
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        private static bool SkipDir(string dir)
+        {
+            try
+            {
+                var di = new DirectoryInfo(dir);
+                FileAttributes a = di.Attributes;
+                if ((a & FileAttributes.ReparsePoint) != 0) return true;   // 符号链接/junction，别跟进去
+                if ((a & FileAttributes.System) != 0) return true;
+                string n = di.Name;
+                if (n.Length == 0 || n[0] == '.') return true;
+                if (n.Equals("node_modules", StringComparison.OrdinalIgnoreCase)) return true;
+                if (n.Equals("AppData", StringComparison.OrdinalIgnoreCase)) return true;
+                if (n.Equals("Windows", StringComparison.OrdinalIgnoreCase)) return true;
+                return false;
+            }
+            catch { return true; }
+        }
+
+        /// 桌面/文档/下载/图片… 这些是用户自己看的目录，不往里写日志
+        private static bool IsUserFolder(string dir)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(dir)) return true;
+                string full = Path.GetFullPath(dir).TrimEnd('\\');
+                Environment.SpecialFolder[] folders = {
+                    Environment.SpecialFolder.Desktop,
+                    Environment.SpecialFolder.DesktopDirectory,
+                    Environment.SpecialFolder.CommonDesktopDirectory,
+                    Environment.SpecialFolder.MyDocuments,
+                    Environment.SpecialFolder.MyMusic,
+                    Environment.SpecialFolder.MyPictures,
+                    Environment.SpecialFolder.MyVideos,
+                    Environment.SpecialFolder.UserProfile
+                };
+                foreach (Environment.SpecialFolder f in folders)
+                {
+                    string s = Environment.GetFolderPath(f);
+                    if (string.IsNullOrEmpty(s)) continue;
+                    if (string.Equals(full, s.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase)) return true;
+                }
+                // 下载 / OneDrive 桌面（SpecialFolder 里没有对应项）
+                string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                if (!string.IsNullOrEmpty(home))
+                {
+                    string[] extra = { "Downloads", "OneDrive\\Desktop", "OneDrive\\桌面", "OneDrive\\Documents" };
+                    foreach (string name in extra)
+                    {
+                        string s = Path.Combine(home, name).TrimEnd('\\');
+                        if (string.Equals(full, s, StringComparison.OrdinalIgnoreCase)) return true;
+                    }
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        /// 文件所在目录不存在就建，然后确认可写
+        private static bool EnsureDir(string file)
+        {
+            try
+            {
+                string dir = Path.GetDirectoryName(file);
+                if (string.IsNullOrEmpty(dir)) return false;
+                if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                return CanWrite(dir);
+            }
+            catch { return false; }
         }
 
         private static bool CanWrite(string dir)
@@ -514,6 +691,7 @@ namespace WpeVideoLauncher
             sb.AppendLine("---------- 自检 " + DateTime.Now + " ----------");
             sb.AppendLine("exe 目录        : " + Config.ExeDir);
             var cfg = Config.Load();
+            sb.AppendLine("日志文件        : " + Log.File);
             if (string.IsNullOrEmpty(cfg.ConfigFile)) cfg.ConfigFile = FindWeConfig();
             sb.AppendLine("config.json     : " + (cfg.ConfigFile ?? "(未找到)"));
             sb.AppendLine("配置文件存在    : " + (cfg.ConfigFile != null && File.Exists(cfg.ConfigFile)));
@@ -863,6 +1041,7 @@ namespace WpeVideoLauncher
             try
             {
                 Config fresh = Config.Load();
+                Log.Reset();   // logFile 可能被改了，下次写日志重新定位
                 _cfg.ConfigFile = fresh.ConfigFile;
                 _cfg.Player = fresh.Player;
                 _cfg.Monitor = fresh.Monitor;

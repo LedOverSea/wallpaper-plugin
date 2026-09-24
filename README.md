@@ -93,6 +93,7 @@ powershell -ExecutionPolicy Bypass -File release\build.ps1
   "monitor":    "Monitor0",
   "extraArgs":  "",
   "showBalloon": true,
+  "logFile":    "",
   "videoExtensions": ".mp4,.webm,.mkv,.avi,.mov,.m4v,.wmv,.flv,.mpg,.mpeg,.ts"
 }
 ```
@@ -105,6 +106,7 @@ powershell -ExecutionPolicy Bypass -File release\build.ps1
 | `monitor` | 取哪个显示器的壁纸，`Monitor0` 起 |
 | `extraArgs` | 追加给播放器的命令行参数，例如 `/new` 让 PotPlayer 开新实例 |
 | `showBalloon` | 是否显示气泡提示 |
+| `logFile` | `launcher.log` 的路径。留空 = 自动定位（项目目录 → exe 旁边 → `%LOCALAPPDATA%`）；填了就用填的（相对路径按 exe 目录算） |
 | `videoExtensions` | 判定为「视频壁纸」的扩展名列表 |
 
 
@@ -136,8 +138,17 @@ WpeVideoLauncher.exe --diagnose   # 自检，把探测结果写进 launcher.log
 若日志里连注册记录都没有，说明没找到 Wallpaper Engine 的 `config.json`（用 `--diagnose` 看）。
 
 **Q: 日志文件在哪？**
-优先在 exe 旁边（`launcher.log`）；若 exe 所在目录不可写，则自动写到
-`%LOCALAPPDATA%\WpeVideoLauncher\launcher.log`。托盘右键 →「打开日志」可直接打开。
+按优先级自动挑一个**可写**的位置：
+
+1. `config.json` 里 `logFile` 指定的路径（绝对路径，或相对 exe 目录）；
+2. **项目目录**（含 `src\WpeVideoLauncher.cs` 的那个目录）—— exe 放在桌面上时也认得出，日志就写在这里，
+   **不会往桌面丢文件**；
+3. exe 所在目录（前提是它不是桌面/文档/下载这类目录）；
+4. `%LOCALAPPDATA%\WpeVideoLauncher\launcher.log`；
+5. 临时目录。
+
+托盘右键 →「打开日志」可直接打开（文件还没生成时会打开它所在的文件夹）。
+想知道这次到底用了哪个路径，运行 `WpeVideoLauncher.exe --diagnose`，第一行就是「日志文件」。
 
 **Q: 播放的是旧壁纸？**
 Wallpaper Engine 在切换壁纸时会写 `config.json`，本工具每次触发都重新读一遍，正常不会旧。
@@ -159,6 +170,7 @@ Wallpaper Engine 在切换壁纸时会写 `config.json`，本工具每次触发�
 ```
 wallpaper plugin\
 ├─ README.md                      本文件（含可行性评估）
+├─ launcher.log                   运行时日志（默认就写在这里，已 git 忽略）
 ├─ src\
 │  ├─ WpeVideoLauncher.cs         全部逻辑（单文件 C#，WinForms 托盘 + 热键 + 内置默认配置）
 │  ├─ app.manifest                asInvoker + PerMonitorV2 DPI
@@ -190,6 +202,7 @@ wallpaper plugin\
 | 路径解析 | 中文/emoji/空格/方括号文件名全部正确传递 |
 | 内存占用 | 空闲工作集约 33–35 MB，专用内存约 25 MB，30 秒累计 CPU 0.16 秒 |
 | 只读目录 | 日志自动回退到 `%LOCALAPPDATA%`，不报错 |
+| 日志落点 | exe 放桌面时，日志写在项目目录 `launcher.log`，桌面不再出现该文件 |
 | 对 WE 的影响 | 零改动（只读它的 config.json） |
 
 ---
