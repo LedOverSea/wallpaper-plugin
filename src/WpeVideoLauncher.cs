@@ -29,15 +29,61 @@ namespace WpeVideoLauncher
         {
             bool once = false;
             bool diag = false;
+            bool scan = false;
+            bool scanAll = false;
+            bool picker = false;
             foreach (string a in args)
             {
                 if (a.Equals("--once", StringComparison.OrdinalIgnoreCase)) once = true;
                 if (a.Equals("--diagnose", StringComparison.OrdinalIgnoreCase)) diag = true;
+                if (a.Equals("--scan", StringComparison.OrdinalIgnoreCase)) scan = true;
+                if (a.Equals("--scan-all", StringComparison.OrdinalIgnoreCase)) { scan = true; scanAll = true; }
+                if (a.Equals("--picker", StringComparison.OrdinalIgnoreCase)) picker = true;
             }
 
             if (diag)
             {
                 Environment.ExitCode = Core.Diagnose();
+                return;
+            }
+
+            if (scan)
+            {
+                // 命令行扫描：--scan 只补新的，--scan-all 把库里现有壁纸全部补一遍
+                Config sc = Config.Load();
+                if (string.IsNullOrEmpty(sc.ConfigFile)) sc.ConfigFile = Core.FindWeConfig();
+                AutoPlaylist.ScanResult r = AutoPlaylist.Scan(sc, scanAll);
+                string plFile = Playlist.FilePath(sc);
+                Console.Error.WriteLine("创意工坊目录: " + (r.WorkshopDir == null ? "(未找到)" : r.WorkshopDir));
+                Console.Error.WriteLine("播放列表    : " + plFile + " (" + Playlist.Count(plFile) + " 项)");
+                Console.Error.WriteLine((scanAll ? "全量扫描    : " : (r.FirstRun ? "首次扫描    : " : "增量扫描    : ")) + r.Detail);
+                Environment.ExitCode = 0;
+                return;
+            }
+
+            if (picker)
+            {
+                // 单独打开「批量选择壁纸」窗口（可以做个快捷方式指过来）
+                Config pc = Config.Load();
+                if (string.IsNullOrEmpty(pc.ConfigFile)) pc.ConfigFile = Core.FindWeConfig();
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
+                string wsPick = Core.FindWorkshopDir(pc);
+                if (string.IsNullOrEmpty(wsPick))
+                {
+                    MessageBox.Show("找不到 Wallpaper Engine 创意工坊目录。\n可以在 config.json 里用 workshopDir 手动指定。",
+                        "WpeVideoLauncher", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    Environment.ExitCode = 6;
+                    return;
+                }
+                List<WallpaperInfo> allPick = Core.GetWallpapers(wsPick, pc.VideoExtensions);
+                Log.Info("批量选择: 工坊=" + wsPick + " 壁纸=" + allPick.Count + " 播放列表=" + Playlist.FilePath(pc));
+                using (var f = new PlaylistForm(pc, allPick))
+                {
+                    Log.Info("窗口 ClientSize=" + f.ClientSize.Width + "x" + f.ClientSize.Height);
+                    f.ShowDialog();
+                }
+                Environment.ExitCode = 0;
                 return;
             }
 
@@ -81,6 +127,9 @@ namespace WpeVideoLauncher
         public string ExtraArgs = "";      // 追加给播放器的参数，例如 /new
         public bool ShowBalloon = true;
         public string LogFile = "";        // launcher.log 路径；留空 = 自动(项目目录 > exe 旁边 > %LOCALAPPDATA%)
+        public string PlaylistFile = "";   // 播放列表(m3u8)路径；留空 = 跟 launcher.log 同目录
+        public string WorkshopDir = "";    // Wallpaper Engine 创意工坊目录；留空 = 自动探测
+        public bool AutoAddDownloads = true; // 新下载的壁纸自动进播放列表
         public string[] VideoExtensions = { ".mp4", ".webm", ".mkv", ".avi", ".mov", ".m4v", ".wmv", ".flv", ".mpg", ".mpeg", ".ts" };
 
         /// 最近一次 Load() 的结果，供 Log 判断用户是否指定了 logFile
@@ -113,6 +162,9 @@ namespace WpeVideoLauncher
             "  \"extraArgs\": \"\",\n" +
             "  \"showBalloon\": true,\n" +
             "  \"logFile\": \"\",\n" +
+            "  \"playlistFile\": \"\",\n" +
+            "  \"workshopDir\": \"\",\n" +
+            "  \"autoAddDownloads\": true,\n" +
             "  \"videoExtensions\": \".mp4,.webm,.mkv,.avi,.mov,.m4v,.wmv,.flv,.mpg,.mpeg,.ts\"\n" +
             "}\n";
 
@@ -143,6 +195,10 @@ namespace WpeVideoLauncher
 
             // 先把 logFile 定下来再写任何日志，免得 WARN 落到默认位置
             c.LogFile = Str(txt, "logFile", c.LogFile);
+            c.PlaylistFile = Str(txt, "playlistFile", c.PlaylistFile);
+            c.WorkshopDir = Str(txt, "workshopDir", c.WorkshopDir);
+            string autoAdd = Str(txt, "autoAddDownloads", null);
+            if (autoAdd != null) c.AutoAddDownloads = !autoAdd.Equals("false", StringComparison.OrdinalIgnoreCase);
             Current = c;
 
             c.ConfigFile = Str(txt, "configFile", c.ConfigFile);
@@ -466,6 +522,20 @@ namespace WpeVideoLauncher
         public string Title;
     }
 
+    /// 一个创意工坊壁纸（一个文件夹）
+    internal sealed class WallpaperInfo
+    {
+        public string Id;        // 创意工坊 id = 文件夹名
+        public string Dir;
+        public string Title;     // project.json 的 title，取不到就用文件夹名
+        public string Type;      // project.json 的 type: video/scene/web/application
+        public string Video;     // 最大的那个视频文件，没有则 null
+        public int VideoCount;
+        public string Size;      // 展示用，例如 "1.2 GB"
+
+        public bool HasVideo { get { return !string.IsNullOrEmpty(Video); } }
+    }
+
     internal static class Core
     {
         private static readonly string[] WeRoots = new string[]
@@ -616,6 +686,193 @@ namespace WpeVideoLauncher
             return false;
         }
 
+        // ---------------- 创意工坊壁纸库 ----------------
+
+        public const string WeAppId = "431960";   // Wallpaper Engine 的 Steam AppId
+
+        /// 创意工坊目录: <Steam库>\steamapps\workshop\content\431960
+        /// 依次从 配置 -> 正在运行的 WE -> WE 的 config.json -> 当前壁纸 -> Steam 注册表 -> 常见路径 猜
+        public static string FindWorkshopDir(Config cfg)
+        {
+            // config 里显式指定的最优先（可以直接是 431960，也可以是它的上级）
+            string own = NormalizeWorkshopDir(cfg == null ? null : cfg.WorkshopDir);
+            if (own != null) return own;
+
+            var cands = new List<string>();
+
+            foreach (string proc in new string[] { "wallpaper64", "wallpaper32" })
+            {
+                try
+                {
+                    foreach (Process p in Process.GetProcessesByName(proc))
+                    {
+                        try
+                        {
+                            string dir = Path.GetDirectoryName(p.MainModule.FileName);
+                            if (!string.IsNullOrEmpty(dir)) cands.Add(dir);
+                        }
+                        catch { }
+                        finally { p.Dispose(); }
+                    }
+                }
+                catch { }
+            }
+
+            string weCfg = null;
+            try { weCfg = FindWeConfig(); } catch { }
+            if (!string.IsNullOrEmpty(weCfg))
+            {
+                cands.Add(Path.GetDirectoryName(weCfg));
+                // 当前正在用的壁纸文件通常就在创意工坊目录里
+                try
+                {
+                    foreach (Promo pr in GetCurrentCandidates(weCfg)) { cands.Add(pr.File); break; }
+                }
+                catch { }
+            }
+
+            try
+            {
+                using (RegistryKey k = Registry.CurrentUser.OpenSubKey(@"Software\Valve\Steam"))
+                    if (k != null)
+                    {
+                        object v = k.GetValue("SteamPath");
+                        if (v != null) cands.Add(v.ToString().Replace('/', '\\'));
+                    }
+            }
+            catch { }
+
+            foreach (string root in WeRoots) cands.Add(root);
+
+            foreach (string c in cands)
+            {
+                string ws = FromSteamApps(c);
+                if (!string.IsNullOrEmpty(ws) && Directory.Exists(ws)) return ws;
+            }
+            return null;
+        }
+
+        /// 把 config 里填的 workshopDir 归一化：
+        /// 直接给 431960 / 给它的上级(content) / 给库目录，都能认
+        private static string NormalizeWorkshopDir(string dir)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(dir)) return null;
+                string d = dir.Replace('/', '\\').TrimEnd('\\');
+                if (!Directory.Exists(d)) return null;
+                if (string.Equals(Path.GetFileName(d), WeAppId, StringComparison.OrdinalIgnoreCase)) return d;
+                string sub = Path.Combine(d, WeAppId);
+                if (Directory.Exists(sub)) return sub;
+                return d;   // 就当它本身就是壁纸目录
+            }
+            catch { return null; }
+        }
+
+        /// 从任意位于 steamapps 里的路径(目录或文件)推出创意工坊目录
+        private static string FromSteamApps(string path)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(path)) return null;
+                DirectoryInfo d = Directory.Exists(path) ? new DirectoryInfo(path) : new FileInfo(path).Directory;
+                for (int i = 0; d != null && i < 10; i++, d = d.Parent)
+                    if (string.Equals(d.Name, "steamapps", StringComparison.OrdinalIgnoreCase))
+                        return Path.Combine(Path.Combine(Path.Combine(d.FullName, "workshop"), "content"), WeAppId);
+            }
+            catch { }
+            return null;
+        }
+
+        /// 列出创意工坊目录下的所有壁纸，按标题排序
+        public static List<WallpaperInfo> GetWallpapers(string workshopDir, string[] exts)
+        {
+            var list = new List<WallpaperInfo>();
+            if (string.IsNullOrEmpty(workshopDir) || !Directory.Exists(workshopDir)) return list;
+            string[] dirs;
+            try { dirs = Directory.GetDirectories(workshopDir); }
+            catch { return list; }
+            foreach (string dir in dirs) list.Add(ReadWallpaper(dir, exts));
+            list.Sort(delegate (WallpaperInfo a, WallpaperInfo b)
+            {
+                return string.Compare(a.Title, b.Title, StringComparison.CurrentCultureIgnoreCase);
+            });
+            return list;
+        }
+
+        /// 读一个壁纸文件夹: 标题、类型、最大的那个视频
+        public static WallpaperInfo ReadWallpaper(string dir, string[] exts)
+        {
+            var info = new WallpaperInfo();
+            info.Dir = dir;
+            try { info.Id = Path.GetFileName(dir.TrimEnd('\\')); } catch { info.Id = dir; }
+            info.Title = info.Id;
+            info.Type = null;
+            try
+            {
+                string txt;
+                if (Config.TryReadAllText(Path.Combine(dir, "project.json"), out txt))
+                {
+                    string t = Config.Str(txt, "title", null);
+                    if (!string.IsNullOrEmpty(t) && t.Trim().Length > 0) info.Title = t.Trim();
+                    string ty = Config.Str(txt, "type", null);
+                    if (!string.IsNullOrEmpty(ty)) info.Type = ty.Trim();
+                }
+            }
+            catch { }
+            FindVideos(info, exts);
+            return info;
+        }
+
+        /// 找出壁纸目录里的视频，记录数量并挑出最大的一个
+        private static void FindVideos(WallpaperInfo info, string[] exts)
+        {
+            string best = null;
+            long bestLen = -1;
+            int count = 0;
+            var stack = new Stack<string>();
+            stack.Push(info.Dir);
+            int guard = 0;
+            while (stack.Count > 0 && guard++ < 500)
+            {
+                string cur = stack.Pop();
+                try
+                {
+                    foreach (string f in Directory.GetFiles(cur))
+                    {
+                        if (!IsVideo(f, exts)) continue;
+                        long len = 0;
+                        try { len = new FileInfo(f).Length; } catch { }
+                        count++;
+                        if (len > bestLen) { bestLen = len; best = f; }
+                    }
+                }
+                catch { }
+                try { foreach (string s in Directory.GetDirectories(cur)) stack.Push(s); }
+                catch { }
+            }
+            info.VideoCount = count;
+            info.Video = best;
+            info.Size = HumanSize(bestLen > 0 ? bestLen : 0);
+        }
+
+        public static string HumanSize(long bytes)
+        {
+            if (bytes <= 0) return "-";
+            double b = bytes;
+            string[] u = { "B", "KB", "MB", "GB", "TB" };
+            int i = 0;
+            while (b >= 1024 && i < u.Length - 1) { b /= 1024; i++; }
+            return (b >= 100 ? b.ToString("0") : b.ToString("0.0")) + " " + u[i];
+        }
+
+        /// 下载中/没写完的临时文件
+        public static bool IsPartial(string path)
+        {
+            string e = Path.GetExtension(path).ToLowerInvariant();
+            return e == ".part" || e == ".tmp" || e == ".crdownload" || e == ".downloading" || e == ".partial";
+        }
+
         /// 播放器自动发现：配置 -> 注册表/常见路径 -> .mp4 默认关联
         public static string ResolvePlayer(Config cfg)
         {
@@ -702,6 +959,18 @@ namespace WpeVideoLauncher
             sb.AppendLine("热键            : " + cfg.Hotkey + " -> packed=0x" + TrayApp.ParseHotkey(cfg.Hotkey).ToString("X"));
             sb.AppendLine("显示器          : " + cfg.Monitor);
             sb.AppendLine("支持的扩展名    : " + string.Join(",", cfg.VideoExtensions));
+            string plFile = Playlist.FilePath(cfg);
+            sb.AppendLine("播放列表        : " + plFile + " (" + Playlist.Count(plFile) + " 项)");
+            string wsDir = FindWorkshopDir(cfg);
+            sb.AppendLine("创意工坊目录    : " + (wsDir == null ? "(未找到)" : wsDir));
+            if (!string.IsNullOrEmpty(wsDir))
+            {
+                List<WallpaperInfo> all = GetWallpapers(wsDir, cfg.VideoExtensions);
+                int withVideo = 0;
+                foreach (WallpaperInfo w in all) if (w.HasVideo) withVideo++;
+                sb.AppendLine("壁纸总数        : " + all.Count + " (含视频 " + withVideo + ")");
+            }
+            sb.AppendLine("自动加入新壁纸  : " + (cfg.AutoAddDownloads ? "开" : "关"));
 
             string reason = null;
             WallpaperEntry cur = null;
@@ -815,6 +1084,7 @@ namespace WpeVideoLauncher
         private HotkeyWindow _hotkey;
         private WallpaperEntry _current;
         private Icon _ownIcon;
+        private System.Windows.Forms.Timer _scanTimer;
 
         public TrayApp()
         {
@@ -830,6 +1100,16 @@ namespace WpeVideoLauncher
             var recent = new ToolStripMenuItem("最近使用过的壁纸");
             menu.Items.Add(recent);
             this.RecentMenu = recent;
+
+            var plMenu = new ToolStripMenuItem("播放列表");
+            plMenu.DropDownItems.Add("▶  播放播放列表", null, delegate { PlayPlaylist(); });
+            plMenu.DropDownItems.Add("批量选择壁纸…", null, delegate { ShowPicker(); });
+            plMenu.DropDownItems.Add(new ToolStripSeparator());
+            plMenu.DropDownItems.Add("把现有壁纸补进播放列表", null, delegate { ScanNow(true); });
+            plMenu.DropDownItems.Add("打开播放列表文件", null, delegate { OpenPath(Playlist.FilePath(_cfg)); });
+            plMenu.DropDownItems.Add("清空播放列表", null, delegate { ClearPlaylist(); });
+            menu.Items.Add(plMenu);
+
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("打开配置文件", null, delegate { OpenConfigFile(); });
             menu.Items.Add("打开配置文件所在的文件夹", null, delegate { OpenPath(Config.ExeDir); });
@@ -863,6 +1143,7 @@ namespace WpeVideoLauncher
             RefreshTooltip();
             Application.ApplicationExit += delegate { Dispose(); };
             StartNotifyListener();
+            StartAutoScan();
         }
 
         public ToolStripMenuItem RecentMenu { get; private set; }
@@ -1036,6 +1317,96 @@ namespace WpeVideoLauncher
             }
         }
 
+        // ---------------- 播放列表 ----------------
+
+        /// 新下载的壁纸自动进播放列表：启动 2 秒后扫一次，之后每 20 秒扫一次
+        /// （没有新壁纸时只列一下目录名，几乎不花代价）
+        private void StartAutoScan()
+        {
+            if (!_cfg.AutoAddDownloads)
+            {
+                Log.Info("自动加入新壁纸：已按配置关闭");
+                return;
+            }
+            var first = new System.Windows.Forms.Timer();
+            first.Interval = 2000;
+            first.Tick += delegate
+            {
+                first.Stop();
+                first.Dispose();
+                ScanNow(false);
+            };
+            first.Start();
+
+            _scanTimer = new System.Windows.Forms.Timer();
+            _scanTimer.Interval = 20000;
+            _scanTimer.Tick += delegate { ScanNow(false); };
+            _scanTimer.Start();
+        }
+
+        private void ScanNow(bool force)
+        {
+            try
+            {
+                AutoPlaylist.ScanResult r = AutoPlaylist.Scan(_cfg, force);
+                if (r.Added > 0)
+                {
+                    var names = new StringBuilder();
+                    for (int i = 0; i < r.Items.Count && i < 3; i++)
+                        names.Append("· ").Append(r.Items[i].Title).Append("\n");
+                    if (r.Items.Count > 3) names.Append("…共 ").Append(r.Added).Append(" 项");
+                    Balloon(r.FirstRun ? "已把现有壁纸加入播放列表" : "新壁纸已加入播放列表", names.ToString());
+                }
+                else if (force)
+                {
+                    Balloon("扫描完成", r.Detail);
+                }
+            }
+            catch (Exception ex) { Log.Error("自动加入播放列表失败: " + ex.Message); }
+        }
+
+        private void PlayPlaylist()
+        {
+            string f = Playlist.FilePath(_cfg);
+            int n = Playlist.Count(f);
+            if (n == 0)
+            {
+                Balloon("播放列表是空的", "托盘菜单 →「播放列表」→「批量选择壁纸…」可以一次勾多个壁纸加进来。");
+                return;
+            }
+            PlayFile(f);
+        }
+
+        private void ShowPicker()
+        {
+            try
+            {
+                string ws = Core.FindWorkshopDir(_cfg);
+                if (string.IsNullOrEmpty(ws))
+                {
+                    Balloon("找不到创意工坊目录", "可以在 config.json 的 workshopDir 里手动指定 431960 目录。");
+                    return;
+                }
+                List<WallpaperInfo> all = Core.GetWallpapers(ws, _cfg.VideoExtensions);
+                using (var f = new PlaylistForm(_cfg, all)) { f.ShowDialog(); }
+            }
+            catch (Exception ex)
+            {
+                Log.Error("打开批量选择窗口失败: " + ex.Message);
+                Balloon("打开批量选择失败", ex.Message);
+            }
+        }
+
+        private void ClearPlaylist()
+        {
+            string f = Playlist.FilePath(_cfg);
+            if (Playlist.Count(f) == 0) { Balloon("播放列表已经是空的", ""); return; }
+            if (MessageBox.Show("确定清空播放列表？\n\n" + f, "WpeVideoLauncher",
+                    MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
+            Playlist.Clear(f);
+            Balloon("播放列表已清空", "之后新下载的壁纸还是会自动加进来。");
+        }
+
         private void Reload()
         {
             try
@@ -1126,9 +1497,630 @@ namespace WpeVideoLauncher
         public void Dispose()
         {
             try { if (_notifyEvent != null) { _notifyEvent.Set(); _notifyEvent.Close(); _notifyEvent = null; } } catch { }
+            if (_scanTimer != null) { _scanTimer.Stop(); _scanTimer.Dispose(); _scanTimer = null; }
             if (_hotkey != null) { _hotkey.Dispose(); _hotkey = null; }
             if (_icon != null) { _icon.Visible = false; _icon.Dispose(); }
             if (_ownIcon != null) { _ownIcon.Dispose(); _ownIcon = null; }
+        }
+    }
+
+    /// 播放列表：通用 m3u8（UTF-8 带 BOM），PotPlayer / VLC / MPC-HC 都能直接播
+    internal static class Playlist
+    {
+        private static readonly object Gate = new object();
+
+        public sealed class Item
+        {
+            public string File;
+            public string Title;
+        }
+
+        /// m3u8 路径：config 指定优先，否则跟 launcher.log 放同一目录
+        public static string FilePath(Config cfg)
+        {
+            try
+            {
+                if (cfg != null && !string.IsNullOrEmpty(cfg.PlaylistFile))
+                    return Path.IsPathRooted(cfg.PlaylistFile)
+                        ? cfg.PlaylistFile
+                        : Path.Combine(Config.ExeDir, cfg.PlaylistFile);
+            }
+            catch { }
+            return Path.Combine(LogDir(), "playlist.m3u8");
+        }
+
+        private static string LogDir()
+        {
+            string dir = null;
+            try { dir = Path.GetDirectoryName(Log.File); } catch { }
+            if (string.IsNullOrEmpty(dir)) dir = Config.ExeDir;
+            return dir;
+        }
+
+        /// "已经见过"的壁纸 id 记录，用来判断哪些壁纸是新下载的
+        public static string SeenFilePath(string playlistFile)
+        {
+            string dir = null;
+            try { dir = Path.GetDirectoryName(playlistFile); } catch { }
+            if (string.IsNullOrEmpty(dir)) dir = Config.ExeDir;
+            return Path.Combine(dir, ".playlist-seen.txt");
+        }
+
+        public static List<Item> Load(string file)
+        {
+            lock (Gate) { return LoadUnlocked(file); }
+        }
+
+        public static int Count(string file)
+        {
+            return Load(file).Count;
+        }
+
+        /// 播放列表里所有视频文件的路径
+        public static HashSet<string> PathSet(string file)
+        {
+            var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (Item i in Load(file)) set.Add(i.File);
+            return set;
+        }
+
+        private static List<Item> LoadUnlocked(string file)
+        {
+            var list = new List<Item>();
+            string txt;
+            if (!Config.TryReadAllText(file, out txt)) return list;
+            string pending = null;
+            foreach (string raw in txt.Split('\n'))
+            {
+                string line = raw.TrimStart('\uFEFF').Trim();
+                if (line.Length == 0) continue;
+                if (line[0] == '#')
+                {
+                    if (line.StartsWith("#EXTINF", StringComparison.OrdinalIgnoreCase))
+                    {
+                        int comma = line.IndexOf(',');
+                        pending = comma >= 0 ? line.Substring(comma + 1).Trim() : null;
+                    }
+                    continue;
+                }
+                var it = new Item();
+                it.File = line;
+                it.Title = string.IsNullOrEmpty(pending) ? Path.GetFileNameWithoutExtension(line) : pending;
+                pending = null;
+                list.Add(it);
+            }
+            return list;
+        }
+
+        /// 追加（按完整路径去重），返回真正新增的条数
+        public static int Add(string file, List<Item> items, out int duplicates)
+        {
+            duplicates = 0;
+            if (items == null || items.Count == 0) return 0;
+            lock (Gate)
+            {
+                List<Item> cur = LoadUnlocked(file);
+                var have = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (Item i in cur) have.Add(i.File);
+                int added = 0;
+                foreach (Item i in items)
+                {
+                    if (i == null || string.IsNullOrEmpty(i.File)) continue;
+                    if (!have.Add(i.File)) { duplicates++; continue; }
+                    cur.Add(i);
+                    added++;
+                }
+                if (added > 0) WriteUnlocked(file, cur);
+                return added;
+            }
+        }
+
+        /// 按完整路径移除，返回移除条数
+        public static int Remove(string file, List<string> paths)
+        {
+            if (paths == null || paths.Count == 0) return 0;
+            var want = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string p in paths) want.Add(p);
+            lock (Gate)
+            {
+                List<Item> cur = LoadUnlocked(file);
+                int removed = 0;
+                for (int i = cur.Count - 1; i >= 0; i--)
+                    if (want.Contains(cur[i].File)) { cur.RemoveAt(i); removed++; }
+                if (removed > 0) WriteUnlocked(file, cur);
+                return removed;
+            }
+        }
+
+        public static void Clear(string file)
+        {
+            lock (Gate) { WriteUnlocked(file, new List<Item>()); }
+        }
+
+        private static void WriteUnlocked(string file, List<Item> items)
+        {
+            try
+            {
+                string dir = Path.GetDirectoryName(file);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                var sb = new StringBuilder();
+                sb.Append("#EXTM3U\r\n");
+                foreach (Item i in items)
+                {
+                    string title = string.IsNullOrEmpty(i.Title) ? Path.GetFileNameWithoutExtension(i.File) : i.Title;
+                    title = title.Replace("\r", " ").Replace("\n", " ");
+                    sb.Append("#EXTINF:-1,").Append(title).Append("\r\n");
+                    sb.Append(i.File).Append("\r\n");
+                }
+                string tmp = file + ".tmp";
+                System.IO.File.WriteAllText(tmp, sb.ToString(), new UTF8Encoding(true));
+                System.IO.File.Copy(tmp, file, true);
+                System.IO.File.Delete(tmp);
+                Log.Info("播放列表已保存: " + file + " (" + items.Count + " 项)");
+            }
+            catch (Exception ex) { Log.Error("写播放列表失败 " + file + " : " + ex.Message); }
+        }
+    }
+
+    /// "已经见过"的壁纸 id（判断哪些是新下载的）
+    internal static class SeenWallpapers
+    {
+        public static bool Exists(string file)
+        {
+            try { return System.IO.File.Exists(file); } catch { return false; }
+        }
+
+        public static HashSet<string> Load(string file)
+        {
+            var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                if (!System.IO.File.Exists(file)) return set;
+                foreach (string line in System.IO.File.ReadAllLines(file))
+                {
+                    string s = line.TrimStart('\uFEFF').Trim();
+                    if (s.Length > 0 && s[0] != '#') set.Add(s);
+                }
+            }
+            catch (Exception ex) { Log.Warn("读已见壁纸记录失败: " + ex.Message); }
+            return set;
+        }
+
+        public static void Save(string file, HashSet<string> ids)
+        {
+            try
+            {
+                string dir = Path.GetDirectoryName(file);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                var list = new List<string>(ids);
+                list.Sort(StringComparer.OrdinalIgnoreCase);
+                System.IO.File.WriteAllLines(file, list.ToArray(), new UTF8Encoding(true));
+            }
+            catch (Exception ex) { Log.Warn("写已见壁纸记录失败: " + ex.Message); }
+        }
+    }
+
+    /// 把新下载的壁纸自动补进播放列表
+    internal static class AutoPlaylist
+    {
+        public sealed class ScanResult
+        {
+            public string WorkshopDir;
+            public string PlaylistFile;
+            public bool FirstRun;
+            public int Total;        // 库里壁纸总数
+            public int Added;        // 本次新加入播放列表的条数
+            public int Duplicates;   // 已经在列表里的
+            public int Pending;      // 还在下载/还没落盘的
+            public List<Playlist.Item> Items = new List<Playlist.Item>();
+            public string Detail = "";
+        }
+
+        /// 扫描一次：
+        ///   首次运行（或 force）= 把库里现有的壁纸全部补进播放列表；
+        ///   平时 = 只补新出现的壁纸。
+        public static ScanResult Scan(Config cfg, bool force)
+        {
+            var r = new ScanResult();
+            string plFile = Playlist.FilePath(cfg);
+            r.PlaylistFile = plFile;
+            string seenFile = Playlist.SeenFilePath(plFile);
+            string ws = Core.FindWorkshopDir(cfg);
+            r.WorkshopDir = ws;
+            if (string.IsNullOrEmpty(ws))
+            {
+                r.Detail = "没找到 Wallpaper Engine 创意工坊目录（可在 config.json 用 workshopDir 指定）";
+                return r;
+            }
+
+            bool firstRun = force || !SeenWallpapers.Exists(seenFile);
+            HashSet<string> seen = firstRun
+                ? new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                : SeenWallpapers.Load(seenFile);
+            r.FirstRun = firstRun;
+
+            string[] dirs;
+            try { dirs = Directory.GetDirectories(ws); }
+            catch (Exception ex) { r.Detail = "读创意工坊目录失败: " + ex.Message; return r; }
+            r.Total = dirs.Length;
+
+            // 快速路径：没有新 id 直接返回，每 20 秒的轮询几乎不花代价
+            var todo = new List<string>();
+            foreach (string d in dirs)
+            {
+                string id = Path.GetFileName(d.TrimEnd('\\'));
+                if (firstRun || !seen.Contains(id)) todo.Add(d);
+            }
+            if (todo.Count == 0)
+            {
+                r.Detail = string.Format("库里 {0} 个壁纸，没有新的", r.Total);
+                return r;
+            }
+
+            var items = new List<Playlist.Item>();
+            foreach (string d in todo)
+            {
+                WallpaperInfo w = Core.ReadWallpaper(d, cfg.VideoExtensions);
+                if (!Settled(w)) { r.Pending++; continue; }   // 还没下载完，下次再看
+                if (w.HasVideo)
+                {
+                    var it = new Playlist.Item();
+                    it.File = w.Video;
+                    it.Title = w.Title;
+                    items.Add(it);
+                }
+                seen.Add(w.Id);   // 没有视频的也记下，免得每次重复检查
+            }
+
+            int dup = 0;
+            if (items.Count > 0) r.Added = Playlist.Add(plFile, items, out dup);
+            r.Duplicates = dup;
+            r.Items = items;
+            SeenWallpapers.Save(seenFile, seen);
+
+            r.Detail = string.Format("{0} 个壁纸，新加入 {1} 项，重复 {2} 项，还在下载 {3} 个",
+                r.Total, r.Added, r.Duplicates, r.Pending);
+            // 只在"首次"或"真有新增"时记日志，否则每 20 秒一次会把日志刷满
+            if (firstRun || r.Added > 0)
+                Log.Info("自动加入播放列表" + (firstRun ? "(首次全量)" : "") + ": " + r.Detail);
+            return r;
+        }
+
+        /// 这个壁纸文件夹下载完了吗：有内容、没有 .part/.tmp 之类、最近 5 秒没有写入；
+        /// 另外 project.json 声明是 video 类型的话，必须已经能看到视频文件。
+        private static bool Settled(WallpaperInfo w)
+        {
+            try
+            {
+                if (!Directory.Exists(w.Dir)) return false;
+                DateTime newest = DateTime.MinValue;
+                bool any = false;
+                foreach (string f in Directory.GetFiles(w.Dir, "*", SearchOption.AllDirectories))
+                {
+                    any = true;
+                    if (Core.IsPartial(f)) return false;
+                    DateTime t;
+                    try { t = System.IO.File.GetLastWriteTimeUtc(f); }
+                    catch { continue; }
+                    if (t > newest) newest = t;
+                }
+                if (!any) return false;                                          // 空目录，再等等
+                if ((DateTime.UtcNow - newest).TotalSeconds < 5) return false;    // 刚写过，再等等
+                if (w.HasVideo) return true;
+                return !(w.Type != null && w.Type.Equals("video", StringComparison.OrdinalIgnoreCase));
+            }
+            catch { return false; }
+        }
+    }
+
+    /// 批量选择壁纸 -> 播放列表
+    internal sealed class PlaylistForm : Form
+    {
+        private sealed class Row
+        {
+            public WallpaperInfo W;
+            public bool InList;
+
+            public override string ToString()
+            {
+                var sb = new StringBuilder();
+                sb.Append(W.HasVideo ? "● " : "○ ");
+                sb.Append(W.Title);
+                if (W.HasVideo)
+                {
+                    sb.Append("    ").Append(W.Size);
+                    if (W.VideoCount > 1) sb.Append("（").Append(W.VideoCount).Append(" 个视频，取最大）");
+                }
+                else
+                {
+                    sb.Append("    [");
+                    sb.Append(string.IsNullOrEmpty(W.Type) ? "没有视频文件" : W.Type + "，没有视频文件");
+                    sb.Append("]");
+                }
+                if (InList) sb.Append("    [已在播放列表]");
+                return sb.ToString();
+            }
+        }
+
+        private readonly Config _cfg;
+        private readonly List<WallpaperInfo> _all;
+        private readonly string _plFile;
+        private readonly HashSet<string> _checked = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _inList = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private TextBox _filter;
+        private CheckedListBox _list;
+        private Label _status;
+        private Panel _topPanel;
+        private Panel _bottomPanel;
+        private FlowLayoutPanel _row1;
+        private FlowLayoutPanel _row2;
+        private string _feedback = "";
+        private bool _loading;
+        private bool _laying;
+
+        public PlaylistForm(Config cfg, List<WallpaperInfo> all)
+        {
+            _cfg = cfg;
+            _all = all == null ? new List<WallpaperInfo>() : all;
+            _plFile = Playlist.FilePath(cfg);
+            ReloadInList();
+            BuildUi();
+            FillList();
+            Render();
+        }
+
+        private void ReloadInList()
+        {
+            _inList.Clear();
+            foreach (string p in Playlist.PathSet(_plFile)) _inList.Add(p);
+        }
+
+        private void BuildUi()
+        {
+            Text = "批量选择壁纸 → 播放列表";
+            Font = SystemFonts.MessageBoxFont;
+            AutoScaleMode = AutoScaleMode.None;   // 自己按 Font.Height 算尺寸，别再让 WinForms 缩放
+            ClientSize = new Size(820, 620);
+            StartPosition = FormStartPosition.CenterScreen;
+            MinimizeBox = false;
+            ShowIcon = false;
+
+            int rowH = Font.Height + 14;
+            int statusH = Font.Height + 10;
+            int cw = ClientSize.Width;
+            int ch = ClientSize.Height;
+            int bottomH = rowH * 2 + statusH;
+
+            // 顶部搜索行
+            var top = new Panel();
+            _topPanel = top;
+            var lbl = new Label();
+            lbl.Text = "搜索:";
+            lbl.Dock = DockStyle.Left;
+            lbl.Width = 52;
+            lbl.TextAlign = ContentAlignment.MiddleLeft;
+            _filter = new TextBox();
+            _filter.Dock = DockStyle.Fill;
+            _filter.TextChanged += delegate { FillList(); Render(); };
+            top.Controls.Add(_filter);   // Fill 的先加，边缘的后加
+            top.Controls.Add(lbl);
+
+            // 列表
+            _list = new CheckedListBox();
+            _list.CheckOnClick = true;
+            _list.IntegralHeight = false;
+            _list.BorderStyle = BorderStyle.FixedSingle;
+            _list.ItemCheck += OnItemCheck;
+
+            // 底部两行按钮 + 状态行
+            var bottom = new Panel();
+            _bottomPanel = bottom;
+
+            var row1 = new FlowLayoutPanel();
+            _row1 = row1;
+            row1.WrapContents = false;
+            row1.Margin = new Padding(0);
+            row1.Controls.Add(MakeButton("全选(有视频)", delegate { CheckAll(true); }));
+            row1.Controls.Add(MakeButton("全不选", delegate { CheckAll(false); }));
+            row1.Controls.Add(MakeButton("反选", delegate { Invert(); }));
+
+            var row2 = new FlowLayoutPanel();
+            _row2 = row2;
+            row2.WrapContents = false;
+            row2.Margin = new Padding(0);
+            row2.Controls.Add(MakeButton("加入播放列表", delegate { AddChecked(); }));
+            row2.Controls.Add(MakeButton("从列表移除", delegate { RemoveChecked(); }));
+            row2.Controls.Add(MakeButton("打开播放列表", delegate { OpenPlaylist(); }));
+            row2.Controls.Add(MakeButton("关闭", delegate { Close(); }));
+
+            _status = new Label();
+            _status.TextAlign = ContentAlignment.MiddleLeft;
+            _status.AutoEllipsis = true;
+            _status.Padding = new Padding(6, 0, 6, 0);
+
+            bottom.Controls.Add(row1);
+            bottom.Controls.Add(row2);
+            bottom.Controls.Add(_status);
+
+            Controls.Add(_list);
+            Controls.Add(bottom);
+            Controls.Add(top);
+
+            ApplyLayout();
+        }
+
+        /// 按"当前真正的"客户区尺寸摆位置。
+        /// 不能用 Dock/Anchor 一把梭：窗体会在构造之后被系统/DPI 改尺寸，
+        /// 那时候控件的绝对坐标就落到客户区外面去了（按钮整行看不见）。
+        protected override void OnLayout(LayoutEventArgs e)
+        {
+            base.OnLayout(e);
+            if (_laying) return;
+            _laying = true;
+            try { ApplyLayout(); }
+            finally { _laying = false; }
+        }
+
+        private void ApplyLayout()
+        {
+            if (_topPanel == null || _list == null || _bottomPanel == null) return;
+            int rowH = Font.Height + 14;
+            int statusH = Font.Height + 10;
+            int cw = ClientSize.Width;
+            int ch = ClientSize.Height;
+            int bottomH = rowH * 2 + statusH;
+
+            _topPanel.SetBounds(0, 0, cw, rowH);
+            _bottomPanel.SetBounds(0, ch - bottomH, cw, bottomH);
+            _list.SetBounds(0, rowH, cw, Math.Max(60, ch - rowH - bottomH));
+            _row1.SetBounds(0, 0, cw, rowH);
+            _row2.SetBounds(0, rowH, cw, rowH);
+            _status.SetBounds(0, rowH * 2, cw, statusH);
+        }
+
+        private static Button MakeButton(string text, EventHandler onClick)
+        {
+            var b = new Button();
+            b.Text = text;
+            b.AutoSize = true;
+            b.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            b.MinimumSize = new Size(100, 26);
+            b.Margin = new Padding(4, 3, 4, 3);
+            b.Click += onClick;
+            return b;
+        }
+
+        private void FillList()
+        {
+            _loading = true;
+            try
+            {
+                _list.Items.Clear();
+                string q = _filter == null ? "" : _filter.Text.Trim();
+                foreach (WallpaperInfo w in _all)
+                {
+                    if (q.Length > 0
+                        && w.Title.IndexOf(q, StringComparison.CurrentCultureIgnoreCase) < 0
+                        && w.Id.IndexOf(q, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    var r = new Row();
+                    r.W = w;
+                    r.InList = w.HasVideo && _inList.Contains(w.Video);
+                    _list.Items.Add(r, w.HasVideo && _checked.Contains(w.Id));
+                }
+            }
+            finally { _loading = false; }
+        }
+
+        private void OnItemCheck(object sender, ItemCheckEventArgs e)
+        {
+            if (_loading) return;
+            Row r = _list.Items[e.Index] as Row;
+            if (r == null) return;
+            if (e.NewValue == CheckState.Checked && !r.W.HasVideo)
+            {
+                e.NewValue = CheckState.Unchecked;
+                SetFeedback("「" + r.W.Title + "」没有视频文件，不能加入播放列表");
+                return;
+            }
+            if (e.NewValue == CheckState.Checked) _checked.Add(r.W.Id);
+            else _checked.Remove(r.W.Id);
+            Render();
+        }
+
+        private void CheckAll(bool on)
+        {
+            _loading = true;
+            try
+            {
+                for (int i = 0; i < _list.Items.Count; i++)
+                {
+                    Row r = _list.Items[i] as Row;
+                    if (r == null || !r.W.HasVideo) continue;
+                    _list.SetItemChecked(i, on);
+                    if (on) _checked.Add(r.W.Id); else _checked.Remove(r.W.Id);
+                }
+            }
+            finally { _loading = false; }
+            SetFeedback(on ? "已勾选当前列表里所有有视频的壁纸" : "已取消勾选");
+        }
+
+        private void Invert()
+        {
+            _loading = true;
+            try
+            {
+                for (int i = 0; i < _list.Items.Count; i++)
+                {
+                    Row r = _list.Items[i] as Row;
+                    if (r == null || !r.W.HasVideo) continue;
+                    bool now = !_list.GetItemChecked(i);
+                    _list.SetItemChecked(i, now);
+                    if (now) _checked.Add(r.W.Id); else _checked.Remove(r.W.Id);
+                }
+            }
+            finally { _loading = false; }
+            SetFeedback("已反选");
+        }
+
+        private void AddChecked()
+        {
+            var items = new List<Playlist.Item>();
+            foreach (WallpaperInfo w in _all)
+            {
+                if (!w.HasVideo || !_checked.Contains(w.Id)) continue;
+                var it = new Playlist.Item();
+                it.File = w.Video;
+                it.Title = w.Title;
+                items.Add(it);
+            }
+            if (items.Count == 0) { SetFeedback("还没有勾选任何带视频的壁纸"); return; }
+            int dup = 0;
+            int added = Playlist.Add(_plFile, items, out dup);
+            ReloadInList();
+            FillList();
+            SetFeedback(string.Format("已加入 {0} 项{1}", added,
+                dup > 0 ? "（" + dup + " 项本来就在列表里）" : ""));
+        }
+
+        private void RemoveChecked()
+        {
+            var paths = new List<string>();
+            foreach (WallpaperInfo w in _all)
+                if (w.HasVideo && _checked.Contains(w.Id) && _inList.Contains(w.Video))
+                    paths.Add(w.Video);
+            if (paths.Count == 0) { SetFeedback("勾选的壁纸都不在播放列表里"); return; }
+            int removed = Playlist.Remove(_plFile, paths);
+            ReloadInList();
+            FillList();
+            SetFeedback("已从播放列表移除 " + removed + " 项");
+        }
+
+        private void OpenPlaylist()
+        {
+            try
+            {
+                if (System.IO.File.Exists(_plFile)) Process.Start("explorer.exe", "\"" + _plFile + "\"");
+                else
+                {
+                    string dir = Path.GetDirectoryName(_plFile);
+                    if (!string.IsNullOrEmpty(dir)) Process.Start("explorer.exe", "\"" + dir + "\"");
+                }
+            }
+            catch (Exception ex) { Log.Warn("打开播放列表失败: " + ex.Message); }
+        }
+
+        private void SetFeedback(string msg)
+        {
+            _feedback = msg;
+            Render();
+        }
+
+        private void Render()
+        {
+            if (_status == null) return;
+            string head = string.IsNullOrEmpty(_feedback) ? "" : _feedback + "    |    ";
+            _status.Text = string.Format("{0}库里 {1} 个壁纸  ·  显示 {2}  ·  已勾选 {3}  ·  播放列表 {4} 项",
+                head, _all.Count, _list.Items.Count, _checked.Count, Playlist.Count(_plFile));
         }
     }
 

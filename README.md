@@ -46,6 +46,9 @@
 - 自动读取 Wallpaper Engine 配置，得到**当前正在使用**的壁纸文件，支持 `.mp4 .webm .mkv .avi .mov .m4v .wmv .flv .mpg .mpeg .ts`。
 - 支持多显示器（`monitor` 指定 `Monitor0` / `Monitor1` …）。
 - 「最近使用过的壁纸」子菜单：直接播历史里的视频壁纸；还列出当前壁纸同目录的其它视频。
+- **播放列表**（`playlist.m3u8`）：把壁纸视频收进列表，一次交给播放器连播。
+- **新下载的壁纸自动进列表**：盯着创意工坊目录，新壁纸一落盘、里面只要有 mp4 就自动追加，**不用按任何键**。
+- **批量勾选**：一个窗口列出库里所有壁纸（带搜索、全选/反选），一次勾几十个一起加进播放列表，不用一个个按热键。
 - 当前壁纸是场景/网页（`scene.pkg`、`index.html`）时，自动改为在资源管理器中定位它，而不是报错。
 - 播放器可配置：默认用 PotPlayer，也能填 VLC / MPC-HC 等任意播放器 exe。
 - 自带 `--diagnose` 自检和 `launcher.log` 日志，出问题好排查。
@@ -94,6 +97,9 @@ powershell -ExecutionPolicy Bypass -File release\build.ps1
   "extraArgs":  "",
   "showBalloon": true,
   "logFile":    "",
+  "playlistFile": "",
+  "workshopDir":  "",
+  "autoAddDownloads": true,
   "videoExtensions": ".mp4,.webm,.mkv,.avi,.mov,.m4v,.wmv,.flv,.mpg,.mpeg,.ts"
 }
 ```
@@ -107,6 +113,9 @@ powershell -ExecutionPolicy Bypass -File release\build.ps1
 | `extraArgs` | 追加给播放器的命令行参数，例如 `/new` 让 PotPlayer 开新实例 |
 | `showBalloon` | 是否显示气泡提示 |
 | `logFile` | `launcher.log` 的路径。留空 = 自动定位（项目目录 → exe 旁边 → `%LOCALAPPDATA%`）；填了就用填的（相对路径按 exe 目录算） |
+| `playlistFile` | 播放列表 `playlist.m3u8` 的路径。留空 = 跟 `logFile` 放同一目录 |
+| `workshopDir` | Wallpaper Engine 创意工坊目录。留空 = 自动探测（WE 进程 → WE 配置 → 当前壁纸路径 → Steam 注册表 → 常见路径）。填 `...\431960` 或它的上级目录都行（多 Steam 库时用得上） |
+| `autoAddDownloads` | 新下载的壁纸是否自动进播放列表，默认 `true`；填 `false` 关掉 |
 | `videoExtensions` | 判定为「视频壁纸」的扩展名列表 |
 
 
@@ -114,19 +123,70 @@ powershell -ExecutionPolicy Bypass -File release\build.ps1
 
 ---
 
-## 五、命令行用法
+## 五、播放列表：自动收集 + 批量勾选
+
+播放列表是通用的 **m3u8**（UTF-8 带 BOM，PotPlayer / VLC / MPC-HC 都能直接播），默认跟日志放在一起：
+`D:\desktop\code\wallpaper plugin\playlist.m3u8`（可用 `playlistFile` 改）。每条都带壁纸标题：
+
+```
+#EXTM3U
+#EXTINF:-1,【Luminous Art】[2023.1] 沙花叉クロヱ
+D:\program files\steam\steamapps\workshop\content\431960\2950069141\Chinese.mp4
+```
+
+### 1. 新下载的壁纸自动进列表（完全不用按键）
+
+程序每 20 秒看一眼 Wallpaper Engine 的创意工坊目录（`...\steamapps\workshop\content\431960`，自动探测，
+也可用 `workshopDir` 指定）。发现有**新的壁纸文件夹**时：
+
+| 情况 | 处理 |
+|---|---|
+| 里面有 mp4 等视频 | 取**体积最大的那个**，用 `project.json` 的标题追加进播放列表，弹气泡提示 |
+| 是场景/网页壁纸（没有视频文件） | 记一笔「已见过」，跳过 |
+| 还在下载（有 `.part`/`.tmp`，或 `project.json` 声明是 video 但视频还没出现，或 5 秒内还有写入） | **先不加**，下个周期再确认，免得把半个文件塞进列表 |
+
+判断「新」靠 `playlist.m3u8` 同目录下的 `.playlist-seen.txt`（记着见过的壁纸 id）。
+**第一次运行会把当时已有的壁纸全部补进去**（本机 48 个壁纸里 45 个有视频，按标题排序）；以后只加新出现的。
+把壁纸从播放列表里手动删掉后不会被重新塞回来。
+
+- 关掉自动收集：`"autoAddDownloads": false`；
+- 想立刻补一次：托盘菜单 →「播放列表」→「把现有壁纸补进播放列表」，或命令行 `--scan-all`。
+
+### 2. 批量勾选壁纸（一次加几十个，不用一个个按热键）
+
+托盘菜单 →「播放列表」→「批量选择壁纸…」（也可以直接 `WpeVideoLauncher.exe --picker`，做个快捷方式指过来）：
+
+- 列出库里**所有**壁纸：有视频的前面是 `●` 并显示体积，没视频的是 `○`，勾不上（会提示原因）；
+- 顶部搜索框按标题或工坊 id 过滤；「全选(有视频)」「全不选」「反选」批量勾；
+- 「加入播放列表」把勾上的一次性追加进去（自动按路径去重，重复的会告诉你几项）；
+- 「从列表移除」把勾上的从播放列表里删掉；
+- 底部状态行实时显示：库里总数 / 当前显示 / 已勾选 / 播放列表总项数。
+
+### 3. 播放
+
+托盘菜单 →「播放列表」：
+
+- **▶ 播放播放列表** —— 把整个 m3u8 交给播放器，从头连播（配合 PotPlayer 的随机/列表循环就是「壁纸电台」）；
+- 打开播放列表文件 / 清空播放列表。
+
+---
+
+## 六、命令行用法
 
 ```powershell
 WpeVideoLauncher.exe              # 托盘模式（正常用法）
 WpeVideoLauncher.exe --once       # 播放一次就退出（桌面快捷方式用的就是这个，适合绑别的启动器/热键工具）
 WpeVideoLauncher.exe --diagnose   # 自检，把探测结果写进 launcher.log
+WpeVideoLauncher.exe --picker     # 只打开「批量选择壁纸」窗口
+WpeVideoLauncher.exe --scan       # 扫一次新壁纸并加进播放列表后退出（首次运行=全量补齐）
+WpeVideoLauncher.exe --scan-all   # 强制把库里现有壁纸全部补进播放列表
 ```
 
-退出码：`0` 成功，`2` 取不到当前壁纸，`3` 当前壁纸不是视频，`4` 找不到播放器，`5` 启动播放器失败。
+退出码：`0` 成功，`2` 取不到当前壁纸，`3` 当前壁纸不是视频，`4` 找不到播放器，`5` 启动播放器失败，`6` 找不到创意工坊目录。
 
 ---
 
-## 六、常见问题
+## 七、常见问题
 
 **Q: 双击 exe 之后没看到任何窗口？**
 正常。它是托盘程序，图标在右下角托盘区（深蓝圆底 + 黄色播放三角），可能需要点托盘的小箭头展开隐藏图标。
@@ -150,6 +210,20 @@ WpeVideoLauncher.exe --diagnose   # 自检，把探测结果写进 launcher.log
 托盘右键 →「打开日志」可直接打开（文件还没生成时会打开它所在的文件夹）。
 想知道这次到底用了哪个路径，运行 `WpeVideoLauncher.exe --diagnose`，第一行就是「日志文件」。
 
+**Q: 播放列表在哪？新下载的壁纸怎么没自动加进去？**
+列表默认是**项目目录**下的 `playlist.m3u8`（跟 `launcher.log` 同目录），托盘右键 →「播放列表」→「打开播放列表文件」能直接看。
+没自动加的话按顺序查：
+
+1. 日志里搜 `自动加入播放列表`。**每次启动后 2 秒会扫一次**（首次全量、之后增量），有新增或首次扫描都会记一行；
+2. `autoAddDownloads` 是不是被设成 `false` 了；
+3. 日志里如果写「没找到 Wallpaper Engine 创意工坊目录」，就用 `workshopDir` 手动指定（`--diagnose` 会打印探测结果）；
+4. 壁纸刚订阅、还在下载时会先压着不加，等下载完的下一个 20 秒周期才进列表；
+5. 该壁纸是场景/网页类型（没有独立视频文件），本来就不会加。
+
+**Q: 怎么一次加很多壁纸？**
+托盘菜单 →「播放列表」→「批量选择壁纸…」：搜索、全选/反选后点「加入播放列表」，
+一次勾几十个也只点一下，不用一个个按 `Ctrl+Alt+P`。勾完可以直接「▶ 播放播放列表」连播。
+
 **Q: 播放的是旧壁纸？**
 Wallpaper Engine 在切换壁纸时会写 `config.json`，本工具每次触发都重新读一遍，正常不会旧。
 若确实旧，多半是你换了壁纸但 WE 还没落盘，稍等一秒再按。多屏时确认 `monitor` 填对了。
@@ -165,14 +239,16 @@ Wallpaper Engine 在切换壁纸时会写 `config.json`，本工具每次触发�
 
 ---
 
-## 七、目录结构
+## 八、目录结构
 
 ```
 wallpaper plugin\
 ├─ README.md                      本文件（含可行性评估）
 ├─ launcher.log                   运行时日志（默认就写在这里，已 git 忽略）
+├─ playlist.m3u8                  播放列表（运行时生成，已 git 忽略）
+├─ .playlist-seen.txt             记着"见过哪些壁纸"，用来判断新下载（已 git 忽略）
 ├─ src\
-│  ├─ WpeVideoLauncher.cs         全部逻辑（单文件 C#，WinForms 托盘 + 热键 + 内置默认配置）
+│  ├─ WpeVideoLauncher.cs         全部逻辑（单文件 C#，WinForms 托盘 + 热键 + 播放列表 + 内置默认配置）
 │  ├─ app.manifest                asInvoker + PerMonitorV2 DPI
 │  └─ app.ico                     图标（10 尺寸，DIB+PNG，已嵌入 exe）
 ├─ tools\
@@ -191,7 +267,7 @@ wallpaper plugin\
 
 ---
 
-## 八、实测记录（2026-09-20，本机）
+## 九、实测记录（2026-09-20 初版 / 2026-10-16 播放列表，本机）
 
 | 项目 | 结果 |
 |---|---|
@@ -203,11 +279,16 @@ wallpaper plugin\
 | 内存占用 | 空闲工作集约 33–35 MB，专用内存约 25 MB，30 秒累计 CPU 0.16 秒 |
 | 只读目录 | 日志自动回退到 `%LOCALAPPDATA%`，不报错 |
 | 日志落点 | exe 放桌面时，日志写在项目目录 `launcher.log`，桌面不再出现该文件 |
+| 播放列表首次补齐 | 48 个壁纸 → 45 个含视频的全部写入 `playlist.m3u8`（按标题排序，每个取体积最大的视频） |
+| 新壁纸自动加入 | **实测**：往工坊目录丢一个新壁纸文件夹，运行中的托盘实例 **18 秒后**自动追加进播放列表，未按任何键 |
+| 下载未完成 | `project.json` 声明 video 但 mp4 尚未落盘时按住不加，mp4 到位后的下一个周期才加入（沙箱实测） |
+| 非视频壁纸 | 场景类型（`scene.pkg`）与压缩包壁纸识别为"无视频"，只记 id 不入列表 |
+| 批量选择窗口 | 列出全部 48 个壁纸（含搜索、全选/反选、状态行），无视频的勾不上并给出提示 |
 | 对 WE 的影响 | 零改动（只读它的 config.json） |
 
 ---
 
-## 九、附录：如果以后想做「原生右键菜单项」（方案 A 要点）
+## 十、附录：如果以后想做「原生右键菜单项」（方案 A 要点）
 
 勘察已确认的插入点（`ui\dist\scripts\scripts.js`，唯一匹配）：
 

@@ -1,4 +1,4 @@
-﻿# install.ps1 - 把 WpeVideoLauncher 装到用户目录(无需管理员权限)
+# install.ps1 - 把 WpeVideoLauncher 装到用户目录(无需管理员权限)
 #   - 复制 exe 与 config.json 到 %LOCALAPPDATA%\WpeVideoLauncher
 #   - 自动探测 Wallpaper Engine 的 config.json 与 PotPlayer 路径并写回配置
 #   - 桌面快捷方式(可选)
@@ -149,4 +149,5 @@ Write-Host ""
 Write-Host "完成。提示:"
 Write-Host "  * 热键默认 Ctrl+Alt+P (在 config.json 的 hotkey 里改, 设成 none 则关闭)"
 Write-Host "  * 托盘图标双击 = 立即播放当前壁纸视频"
+Write-Host "  * 播放列表: 托盘右键 ->「播放列表」->「批量选择壁纸…」一次勾多个; 新下载的壁纸会自动进列表"
 Write-Host "  * 自检: 运行 `"$exeDst`" --diagnose , 然后查看 $dest\launcher.log"

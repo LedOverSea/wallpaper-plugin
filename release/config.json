@@ -6,5 +6,8 @@
   "extraArgs": "",
   "showBalloon": true,
   "logFile": "",
+  "playlistFile": "",
+  "workshopDir": "",
+  "autoAddDownloads": true,
   "videoExtensions": ".mp4,.webm,.mkv,.avi,.mov,.m4v,.wmv,.flv,.mpg,.mpeg,.ts"
 }
