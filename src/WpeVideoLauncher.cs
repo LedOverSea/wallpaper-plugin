@@ -9,8 +9,11 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.Win32;
+using System.Web.Script.Serialization;
 
 [assembly: System.Reflection.AssemblyTitle("Wallpaper Engine 视频播放助手")]
 [assembly: System.Reflection.AssemblyProduct("WpeVideoLauncher")]
@@ -193,20 +196,30 @@ namespace WpeVideoLauncher
             if (TryReadAllText(ConfigPath, out userTxt)) txt = userTxt;
             else if (TryReadAllText(UserConfigPath, out userTxt)) txt = userTxt;
 
+            // 优先使用正式 JSON 解析；失败时保留旧的宽松解析作为兼容兜底
+            Dictionary<string, object> obj = null;
+            try { obj = new JavaScriptSerializer().DeserializeObject(txt) as Dictionary<string, object>; }
+            catch (Exception ex) { Log.Warn("配置 JSON 无法解析，将使用兼容模式: " + ex.Message); }
+            Func<string, string, string> get = delegate(string key, string def)
+            {
+                if (obj != null && obj.ContainsKey(key) && obj[key] != null) return Convert.ToString(obj[key], System.Globalization.CultureInfo.InvariantCulture);
+                return Str(txt, key, def);
+            };
+
             // 先把 logFile 定下来再写任何日志，免得 WARN 落到默认位置
-            c.LogFile = Str(txt, "logFile", c.LogFile);
-            c.PlaylistFile = Str(txt, "playlistFile", c.PlaylistFile);
-            c.WorkshopDir = Str(txt, "workshopDir", c.WorkshopDir);
-            string autoAdd = Str(txt, "autoAddDownloads", null);
+            c.LogFile = get("logFile", c.LogFile);
+            c.PlaylistFile = get("playlistFile", c.PlaylistFile);
+            c.WorkshopDir = get("workshopDir", c.WorkshopDir);
+            string autoAdd = get("autoAddDownloads", null);
             if (autoAdd != null) c.AutoAddDownloads = !autoAdd.Equals("false", StringComparison.OrdinalIgnoreCase);
             Current = c;
 
-            c.ConfigFile = Str(txt, "configFile", c.ConfigFile);
-            c.Player = Str(txt, "player", c.Player);
-            c.Hotkey = Str(txt, "hotkey", c.Hotkey);
-            c.Monitor = Str(txt, "monitor", c.Monitor);
-            c.ExtraArgs = Str(txt, "extraArgs", c.ExtraArgs);
-            string ext = Str(txt, "videoExtensions", null);
+            c.ConfigFile = get("configFile", c.ConfigFile);
+            c.Player = get("player", c.Player);
+            c.Hotkey = get("hotkey", c.Hotkey);
+            c.Monitor = get("monitor", c.Monitor);
+            c.ExtraArgs = get("extraArgs", c.ExtraArgs);
+            string ext = get("videoExtensions", null);
             if (!string.IsNullOrEmpty(ext))
             {
                 var list = new List<string>();
@@ -219,7 +232,7 @@ namespace WpeVideoLauncher
                 }
                 if (list.Count > 0) c.VideoExtensions = list.ToArray();
             }
-            string balloon = Str(txt, "showBalloon", null);
+            string balloon = get("showBalloon", null);
             if (balloon != null) c.ShowBalloon = !balloon.Equals("false", StringComparison.OrdinalIgnoreCase);
 
             if (string.IsNullOrEmpty(c.ConfigFile)) c.ConfigFile = Core.FindWeConfig();
@@ -610,7 +623,11 @@ namespace WpeVideoLauncher
             if (wc >= 0) scope = txt.Substring(wc);
 
             string file = ExtractMonitor(scope, monitor);
-            if (file == null) file = ExtractFirstMonitor(scope);
+            if (file == null)
+            {
+                file = ExtractFirstMonitor(scope);
+                if (file != null) Log.Warn("未找到显示器 " + monitor + "，已回退到第一个可用显示器");
+            }
             if (file == null) { reason = "配置里没有 selectedwallpapers 记录"; return null; }
 
             file = file.Replace('/', '\\');
@@ -1095,6 +1112,7 @@ namespace WpeVideoLauncher
             _ownIcon = BuildIcon();
             var menu = new ContextMenuStrip();
             menu.Items.Add("▶  播放当前壁纸视频", null, delegate { PlayCurrent(); });
+            menu.Items.Add("👁  预览当前壁纸", null, delegate { PreviewCurrent(); });
             menu.Items.Add(new ToolStripSeparator());
 
             var recent = new ToolStripMenuItem("最近使用过的壁纸");
@@ -1103,6 +1121,9 @@ namespace WpeVideoLauncher
 
             var plMenu = new ToolStripMenuItem("播放列表");
             plMenu.DropDownItems.Add("▶  播放播放列表", null, delegate { PlayPlaylist(); });
+            plMenu.DropDownItems.Add("🔀 随机播放", null, delegate { ShufflePlaylist(); });
+            plMenu.DropDownItems.Add("🧹 清理失效项", null, delegate { RemoveMissing(); });
+            plMenu.DropDownItems.Add("切换播放列表…", null, delegate { ChoosePlaylist(); });
             plMenu.DropDownItems.Add("批量选择壁纸…", null, delegate { ShowPicker(); });
             plMenu.DropDownItems.Add(new ToolStripSeparator());
             plMenu.DropDownItems.Add("把现有壁纸补进播放列表", null, delegate { ScanNow(true); });
@@ -1112,6 +1133,7 @@ namespace WpeVideoLauncher
 
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("打开配置文件", null, delegate { OpenConfigFile(); });
+            menu.Items.Add("设置…", null, delegate { ShowSettings(); });
             menu.Items.Add("打开配置文件所在的文件夹", null, delegate { OpenPath(Config.ExeDir); });
             menu.Items.Add("打开日志", null, delegate { OpenPath(Log.File); });
             menu.Items.Add("重新加载配置", null, delegate { Reload(); });
@@ -1301,6 +1323,24 @@ namespace WpeVideoLauncher
             PlayFile(cur.File);
         }
 
+        private void PreviewCurrent()
+        {
+            string reason = null; WallpaperEntry cur = !string.IsNullOrEmpty(_cfg.ConfigFile) ? Core.GetCurrent(_cfg.ConfigFile, _cfg.Monitor, out reason) : null;
+            if (cur == null) { Balloon("无法预览", reason ?? "没有找到当前壁纸"); return; }
+            try
+            {
+                string target = cur.File;
+                if (Directory.Exists(target))
+                {
+                    string html = Path.Combine(target, "index.html");
+                    if (File.Exists(html)) target = html;
+                }
+                Process.Start(new ProcessStartInfo { FileName = target, UseShellExecute = true });
+                Log.Info("已打开壁纸预览: " + target);
+            }
+            catch (Exception ex) { Log.Error("打开壁纸预览失败: " + ex.Message); Balloon("预览失败", ex.Message); }
+        }
+
         private void PlayFile(string file)
         {
             string player = Core.ResolvePlayer(_cfg);
@@ -1346,9 +1386,13 @@ namespace WpeVideoLauncher
 
         private void ScanNow(bool force)
         {
-            try
+            Task.Run(delegate
             {
-                AutoPlaylist.ScanResult r = AutoPlaylist.Scan(_cfg, force);
+                try
+                {
+                    AutoPlaylist.ScanResult r = AutoPlaylist.Scan(_cfg, force);
+                    _icon.ContextMenuStrip.BeginInvoke((Action)delegate
+                    {
                 if (r.Added > 0)
                 {
                     var names = new StringBuilder();
@@ -1361,8 +1405,40 @@ namespace WpeVideoLauncher
                 {
                     Balloon("扫描完成", r.Detail);
                 }
+                    });
+                }
+                catch (Exception ex) { Log.Error("自动加入播放列表失败: " + ex.Message); }
+            });
+        }
+
+        private void ShufflePlaylist()
+        {
+            string f = Playlist.FilePath(_cfg); int n = Playlist.Shuffle(f);
+            Balloon("播放列表已随机排序", "共处理 " + n + " 项");
+        }
+
+        private void RemoveMissing()
+        {
+            string f = Playlist.FilePath(_cfg); int n = Playlist.RemoveMissing(f);
+            Balloon("已清理失效项", "移除 " + n + " 项");
+        }
+
+        private void ChoosePlaylist()
+        {
+            using (var d = new OpenFileDialog())
+            {
+                d.Filter = "播放列表 (*.m3u;*.m3u8)|*.m3u;*.m3u8|所有文件|*.*";
+                if (d.ShowDialog() != DialogResult.OK) return;
+                _cfg.PlaylistFile = d.FileName; Balloon("已切换播放列表", d.FileName);
             }
-            catch (Exception ex) { Log.Error("自动加入播放列表失败: " + ex.Message); }
+        }
+
+        private void ShowSettings()
+        {
+            using (var f = new SettingsForm(_cfg))
+            {
+                if (f.ShowDialog() == DialogResult.OK) { Reload(); Balloon("设置已保存", "配置已重新加载"); }
+            }
         }
 
         private void PlayPlaylist()
@@ -1418,6 +1494,11 @@ namespace WpeVideoLauncher
                 _cfg.Monitor = fresh.Monitor;
                 _cfg.ExtraArgs = fresh.ExtraArgs;
                 _cfg.VideoExtensions = fresh.VideoExtensions;
+                _cfg.LogFile = fresh.LogFile;
+                _cfg.PlaylistFile = fresh.PlaylistFile;
+                _cfg.WorkshopDir = fresh.WorkshopDir;
+                _cfg.AutoAddDownloads = fresh.AutoAddDownloads;
+                _cfg.ShowBalloon = fresh.ShowBalloon;
                 if (!string.Equals(fresh.Hotkey, _cfg.Hotkey, StringComparison.OrdinalIgnoreCase))
                 {
                     _cfg.Hotkey = fresh.Hotkey;
@@ -1426,6 +1507,8 @@ namespace WpeVideoLauncher
                         _hotkey = new HotkeyWindow(ParseHotkey(_cfg.Hotkey), delegate { PlayCurrent(); });
                 }
                 RefreshTooltip();
+                if (_scanTimer != null) { _scanTimer.Stop(); _scanTimer.Dispose(); _scanTimer = null; }
+                StartAutoScan();
                 Balloon("配置已重新加载", "热键 " + _cfg.Hotkey);
             }
             catch (Exception ex) { Log.Error("重载配置失败: " + ex.Message); }
@@ -1505,6 +1588,38 @@ namespace WpeVideoLauncher
     }
 
     /// 播放列表：通用 m3u8（UTF-8 带 BOM），PotPlayer / VLC / MPC-HC 都能直接播
+    internal sealed class SettingsForm : Form
+    {
+        private readonly Config _cfg;
+        private readonly TextBox _player, _hotkey, _monitor, _we, _workshop, _extra;
+        private readonly CheckBox _auto;
+        public SettingsForm(Config cfg)
+        {
+            _cfg = cfg; Text = "WpeVideoLauncher 设置"; Width = 620; Height = 330; StartPosition = FormStartPosition.CenterScreen;
+            var table = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 7, Padding = new Padding(10) };
+            table.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120)); table.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            _player = Add(table, 0, "播放器路径", cfg.Player); _hotkey = Add(table, 1, "全局热键", cfg.Hotkey); _monitor = Add(table, 2, "显示器", cfg.Monitor);
+            _we = Add(table, 3, "WE config.json", cfg.ConfigFile); _workshop = Add(table, 4, "创意工坊目录", cfg.WorkshopDir); _extra = Add(table, 5, "播放器参数", cfg.ExtraArgs);
+            _auto = new CheckBox { Text = "自动加入新下载壁纸", Checked = cfg.AutoAddDownloads, Dock = DockStyle.Fill }; table.Controls.Add(new Label { Text = "自动扫描", AutoSize = true }, 0, 6); table.Controls.Add(_auto, 1, 6);
+            var buttons = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 42, FlowDirection = FlowDirection.RightToLeft };
+            var ok = new Button { Text = "保存", DialogResult = DialogResult.OK, Width = 90 }; ok.Click += delegate { Save(); };
+            var test = new Button { Text = "测试播放器", Width = 100 }; test.Click += delegate { TestPlayer(); };
+            var cancel = new Button { Text = "取消", DialogResult = DialogResult.Cancel, Width = 90 }; buttons.Controls.Add(ok); buttons.Controls.Add(cancel); buttons.Controls.Add(test);
+            Controls.Add(table); Controls.Add(buttons); AcceptButton = ok; CancelButton = cancel;
+        }
+        private TextBox Add(TableLayoutPanel t, int row, string label, string value)
+        { t.Controls.Add(new Label { Text = label, AutoSize = true, Anchor = AnchorStyles.Left }, 0, row); var b = new TextBox { Text = value ?? "", Dock = DockStyle.Fill }; t.Controls.Add(b, 1, row); return b; }
+        private void TestPlayer()
+        { try { string p = _player.Text.Trim().Trim('"'); if (!File.Exists(p)) throw new Exception("播放器文件不存在"); Process.Start(new ProcessStartInfo { FileName = p, Arguments = "", UseShellExecute = true }); } catch (Exception ex) { MessageBox.Show(ex.Message, "测试失败", MessageBoxButtons.OK, MessageBoxIcon.Error); } }
+        private void Save()
+        {
+            string path = Config.ConfigPath; try { Directory.CreateDirectory(Path.GetDirectoryName(path)); } catch { }
+            Func<string, string> q = delegate(string s) { return (s ?? "").Replace("\\", "\\\\").Replace("\"", "\\\""); };
+            string json = "{\n  \"configFile\": \"" + q(_we.Text) + "\",\n  \"player\": \"" + q(_player.Text) + "\",\n  \"hotkey\": \"" + q(_hotkey.Text) + "\",\n  \"monitor\": \"" + q(_monitor.Text) + "\",\n  \"extraArgs\": \"" + q(_extra.Text) + "\",\n  \"showBalloon\": true,\n  \"workshopDir\": \"" + q(_workshop.Text) + "\",\n  \"autoAddDownloads\": " + (_auto.Checked ? "true" : "false") + "\n}\n";
+            try { File.WriteAllText(path, json, new UTF8Encoding(false)); } catch (Exception ex) { MessageBox.Show(ex.Message, "保存失败", MessageBoxButtons.OK, MessageBoxIcon.Error); }
+        }
+    }
+
     internal static class Playlist
     {
         private static readonly object Gate = new object();
@@ -1635,6 +1750,29 @@ namespace WpeVideoLauncher
         public static void Clear(string file)
         {
             lock (Gate) { WriteUnlocked(file, new List<Item>()); }
+        }
+
+        public static int RemoveMissing(string file)
+        {
+            lock (Gate)
+            {
+                List<Item> cur = LoadUnlocked(file); int before = cur.Count;
+                cur.RemoveAll(delegate(Item i) { return i == null || string.IsNullOrEmpty(i.File) || !System.IO.File.Exists(i.File); });
+                if (cur.Count != before) WriteUnlocked(file, cur);
+                return before - cur.Count;
+            }
+        }
+
+        public static int Shuffle(string file)
+        {
+            lock (Gate)
+            {
+                List<Item> cur = LoadUnlocked(file);
+                Random rnd = new Random();
+                for (int i = cur.Count - 1; i > 0; i--) { int j = rnd.Next(i + 1); Item t = cur[i]; cur[i] = cur[j]; cur[j] = t; }
+                if (cur.Count > 1) WriteUnlocked(file, cur);
+                return cur.Count;
+            }
         }
 
         private static void WriteUnlocked(string file, List<Item> items)

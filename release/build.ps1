@@ -43,6 +43,7 @@ $cscArgs = @(
     '/reference:System.Drawing.dll'
     '/reference:System.Windows.Forms.dll'
     '/reference:System.Core.dll'
+    '/reference:System.Web.Extensions.dll'
 )
 if (-not $NoIcon -and (Test-Path $ico)) { $cscArgs += "/win32icon:$ico" }
 $cscArgs += $code
